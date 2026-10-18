@@ -1,13 +1,14 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 import json
 import httpx
 
 from extractor import extract_text, chunk_text
-from ollama_client import (embed, retrieve, chat, chat_stream, summarize,
-                           generate_flashcards, generate_quiz, 
+from ollama_client import (embed, retrieve, chat_stream, summarize,
+                           generate_flashcards, generate_quiz,
                            generate_notes, extract_formulas, rerank)
 from session_manager import (
     create_session,
@@ -69,14 +70,14 @@ def process_embeddings_background(session_id: str, chunks: list[str]):
             session["status"] = "ready"
             session["progress"] = 100
             return
-            
+
         for i, chunk in enumerate(chunks):
             chunk_emb = embed(chunk)
             embeddings.append(chunk_emb)
             progress = int(((i + 1) / total) * 100)
             session["chunk_embeddings"] = embeddings
             session["progress"] = progress
-            
+
         session["status"] = "ready"
     except Exception as exc:
         try:
@@ -86,17 +87,41 @@ def process_embeddings_background(session_id: str, chunks: list[str]):
         except KeyError:
             pass
 
+def require_ready_session(session_id: str) -> dict:
+    """Return the session, or raise 404 if unknown / 400 if still indexing."""
+    try:
+        session = get_session(session_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Session not found") from None
+    if session.get("status") != "ready":
+        raise HTTPException(status_code=400, detail="Document still indexing")
+    return session
+
+
+def run_model(fn, *args):
+    """Call a model helper, mapping Ollama failures to 502 and bugs to 500."""
+    try:
+        return fn(*args)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @app.post("/upload")
 async def upload_document(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     file_bytes = await file.read()
 
     try:
-        document_text = extract_text(file_bytes, file.filename)
+        # PDF/DOCX parsing is CPU-bound; keep it off the event loop.
+        document_text = await run_in_threadpool(
+            extract_text, file_bytes, file.filename or ""
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     chunks = chunk_text(document_text)
-    
+
     session_id = create_session(document_text, chunks)
     background_tasks.add_task(process_embeddings_background, session_id, chunks)
 
@@ -115,17 +140,12 @@ async def get_status(session_id: str):
             "error_detail": session.get("error_detail", None)
         }
     except KeyError:
-        raise HTTPException(status_code=404, detail="Session not found")
+        raise HTTPException(status_code=404, detail="Session not found") from None
 
 
 @app.post("/chat")
-async def chat_endpoint(req: ChatRequest):
-    try:
-        session = get_session(req.session_id)
-        if session.get("status") != "ready":
-            raise HTTPException(status_code=400, detail="Document depends are still indexing")
-    except KeyError:
-        raise HTTPException(status_code=404, detail="Session not found")
+def chat_endpoint(req: ChatRequest):
+    session = require_ready_session(req.session_id)
 
     try:
         # Step 1: Get top 20 candidates with hybrid search
@@ -152,7 +172,7 @@ async def chat_endpoint(req: ChatRequest):
     system_prompt = f"""## LANGUAGE RULES:
 Detect the language of the student's question automatically.
 - If the question is in Arabic → respond entirely in Arabic (Modern Standard Arabic)
-- If the question is in French → respond entirely in French  
+- If the question is in French → respond entirely in French
 - If the question is in English → respond entirely in English
 - If mixed → respond in the dominant language of the question
 Never mix languages in a single response.
@@ -228,8 +248,6 @@ These excerpts were retrieved using hybrid semantic + keyword search, so they ar
 
     history = get_recent_history(req.session_id)
 
-    append_message(req.session_id, "user", req.message)
-
     full_reply = []
 
     def generate():
@@ -242,6 +260,9 @@ These excerpts were retrieved using hybrid semantic + keyword search, so they ar
             return
 
         complete_reply = "".join(full_reply)
+        # Record the turn only once it succeeded, so a failed reply never
+        # leaves an unanswered user message in the history.
+        append_message(req.session_id, "user", req.message)
         append_message(req.session_id, "assistant", complete_reply)
 
         citations = [
@@ -258,18 +279,9 @@ These excerpts were retrieved using hybrid semantic + keyword search, so they ar
 
 
 @app.post("/summarize")
-async def summarize_document(request: SummarizeRequest) -> dict:
-    try:
-        session = get_session(request.session_id)
-        if session.get("status") != "ready":
-            raise HTTPException(status_code=400, detail="Document still indexing")
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail="Session not found") from exc
-
-    try:
-        summary = summarize(session["document_text"])
-    except RuntimeError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+def summarize_document(request: SummarizeRequest) -> dict:
+    session = require_ready_session(request.session_id)
+    summary = run_model(summarize, session["document_text"])
     return {"summary": summary}
 
 
@@ -288,63 +300,35 @@ async def remove_session(session_id: str) -> dict:
 
 
 @app.post("/flashcards")
-async def flashcards_endpoint(req: SummarizeRequest):
-    try:
-        session = get_session(req.session_id)
-        if session.get("status") != "ready":
-            raise HTTPException(status_code=400, detail="Document still indexing")
-        cards = generate_flashcards(session["document_text"])
-        return {"flashcards": cards, "count": len(cards)}
-    except KeyError:
-        raise HTTPException(status_code=404, detail="Session not found")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+def flashcards_endpoint(req: SummarizeRequest):
+    session = require_ready_session(req.session_id)
+    cards = run_model(generate_flashcards, session["document_text"])
+    return {"flashcards": cards, "count": len(cards)}
 
 
 @app.post("/quiz")
-async def quiz_endpoint(req: QuizRequest):
-    try:
-        session = get_session(req.session_id)
-        if session.get("status") != "ready":
-            raise HTTPException(status_code=400, detail="Document still indexing")
-        questions = generate_quiz(session["document_text"], req.difficulty)
-        return {"questions": questions, "count": len(questions), "difficulty": req.difficulty}
-    except KeyError:
-        raise HTTPException(status_code=404, detail="Session not found")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+def quiz_endpoint(req: QuizRequest):
+    session = require_ready_session(req.session_id)
+    questions = run_model(generate_quiz, session["document_text"], req.difficulty)
+    return {"questions": questions, "count": len(questions), "difficulty": req.difficulty}
 
 
 @app.post("/notes")
-async def notes_endpoint(req: NotesRequest):
-    try:
-        session = get_session(req.session_id)
-        if session.get("status") != "ready":
-            raise HTTPException(status_code=400, detail="Document still indexing")
-        notes = generate_notes(session["document_text"], req.format)
-        return {"notes": notes, "format": req.format}
-    except KeyError:
-        raise HTTPException(status_code=404, detail="Session not found")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+def notes_endpoint(req: NotesRequest):
+    session = require_ready_session(req.session_id)
+    notes = run_model(generate_notes, session["document_text"], req.format)
+    return {"notes": notes, "format": req.format}
 
 
 @app.post("/formulas")
-async def formulas_endpoint(req: SummarizeRequest):
-    try:
-        session = get_session(req.session_id)
-        if session.get("status") != "ready":
-            raise HTTPException(status_code=400, detail="Document still indexing")
-        formulas = extract_formulas(session["document_text"])
-        return {"formulas": formulas, "count": len(formulas)}
-    except KeyError:
-        raise HTTPException(status_code=404, detail="Session not found")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+def formulas_endpoint(req: SummarizeRequest):
+    session = require_ready_session(req.session_id)
+    formulas = run_model(extract_formulas, session["document_text"])
+    return {"formulas": formulas, "count": len(formulas)}
 
 
 @app.get("/health")
-async def health() -> dict:
+def health() -> dict:
     try:
         httpx.get("http://localhost:11434", timeout=2)
         return {"ollama": "connected"}

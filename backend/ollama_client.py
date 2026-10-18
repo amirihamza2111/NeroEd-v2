@@ -1,3 +1,6 @@
+import json
+import re
+
 import httpx
 import numpy as np
 from rank_bm25 import BM25Okapi
@@ -7,6 +10,19 @@ OLLAMA_URL = "http://localhost:11434"
 CHAT_MODEL = "llama3"
 EMBED_MODEL = "nomic-embed-text"
 RERANKER_MODEL = "BAAI/bge-reranker-base"
+# The first request after Ollama starts has to load the model into memory,
+# which can take far longer than httpx's 5 second default.
+EMBED_TIMEOUT = httpx.Timeout(120.0, connect=5.0)
+# Ollama defaults to a small context window and silently drops whatever does
+# not fit. llama3 supports 8k tokens, so ask for all of it.
+CHAT_OPTIONS = {"num_ctx": 8192}
+# ~4k tokens per section leaves room for the system prompt and the reply.
+SUMMARY_SECTION_CHARS = 16000
+MAX_CONDENSE_ROUNDS = 3
+SECTION_NOTES_PROMPT = """You are taking study notes on one section of a longer document.
+Write dense, specific notes covering every concept, definition, formula, date,
+number, and argument in this section. Keep technical terms exactly as written.
+Do not add an introduction or conclusion. Output notes only."""
 _reranker = None
 
 
@@ -28,8 +44,12 @@ def embed(text: str) -> list[float]:
     payload = {"model": EMBED_MODEL, "prompt": text}
 
     try:
-        response = httpx.post(url, json=payload)
+        response = httpx.post(url, json=payload, timeout=EMBED_TIMEOUT)
         response.raise_for_status()
+    except httpx.TimeoutException as exc:
+        raise RuntimeError(
+            f"Ollama timed out while embedding with '{EMBED_MODEL}'"
+        ) from exc
     except httpx.RequestError as exc:
         raise RuntimeError(
             "Ollama is not running. Start it with: ollama serve"
@@ -106,7 +126,7 @@ def get_reranker() -> CrossEncoder:
 def rerank(query: str, candidates: list[dict], top_k: int = 5) -> list[dict]:
     """
     Re-rank candidate chunks using bge-reranker-base cross-encoder.
-    
+
     Input: list of dicts with keys: chunk, score, index
     Output: top_k dicts re-sorted by reranker score, with reranker_score added
     """
@@ -142,14 +162,22 @@ def chat_stream(system_prompt: str, history: list[dict], user_message: str):
         with httpx.stream(
             "POST",
             f"{OLLAMA_URL}/api/chat",
-            json={"model": CHAT_MODEL, "messages": messages, "stream": True},
+            json={
+                "model": CHAT_MODEL,
+                "messages": messages,
+                "stream": True,
+                "options": CHAT_OPTIONS,
+            },
             timeout=120,
         ) as response:
+            if response.status_code >= 400:
+                response.read()
+                raise RuntimeError(_extract_ollama_error(response))
             for line in response.iter_lines():
                 if line:
-                    import json
-
                     data = json.loads(line)
+                    if data.get("error"):
+                        raise RuntimeError(str(data["error"]))
                     token = data.get("message", {}).get("content", "")
                     if token:
                         yield token
@@ -170,7 +198,12 @@ def chat(system_prompt: str, history: list[dict], user_message: str) -> str:
         *history,
         {"role": "user", "content": user_message},
     ]
-    payload = {"model": CHAT_MODEL, "messages": messages, "stream": False}
+    payload = {
+        "model": CHAT_MODEL,
+        "messages": messages,
+        "stream": False,
+        "options": CHAT_OPTIONS,
+    }
 
     try:
         response = httpx.post(url, json=payload,timeout=300.0)
@@ -232,13 +265,50 @@ Exactly 5 bullet points. Each one a complete standalone fact.
 - Use analogies for complex ideas
 - Preserve technical terms but explain on first use"""
 
+    condensed = _condense_for_summary(document_text)
+    if condensed is document_text:
+        intro = "Analyze and summarize the following document. "
+    else:
+        intro = (
+            "The document was too long to read in one pass, so below are "
+            "detailed notes taken section by section, in order. Treat them "
+            "as the full document. "
+        )
+
     user_message = (
-        "Analyze and summarize the following document. "
-        "Think carefully about what matters most before writing. "
+        intro
+        + "Think carefully about what matters most before writing. "
         "A student's exam grade depends on your summary:\n\n"
-        f"{document_text}"
+        f"{condensed}"
     )
     return chat(system_prompt=system_prompt, history=[], user_message=user_message)
+
+
+def _split_sections(text: str, size: int) -> list[str]:
+    return [text[i : i + size] for i in range(0, len(text), size)]
+
+
+def _condense_for_summary(document_text: str) -> str:
+    """
+    Map-reduce long documents so the final summary prompt fits in the
+    model's context window. Short documents are returned unchanged.
+    """
+    text = document_text
+    for _ in range(MAX_CONDENSE_ROUNDS):
+        if len(text) <= SUMMARY_SECTION_CHARS:
+            return text
+        sections = _split_sections(text, SUMMARY_SECTION_CHARS)
+        notes = []
+        for n, section in enumerate(sections, start=1):
+            note = chat(
+                system_prompt=SECTION_NOTES_PROMPT,
+                history=[],
+                user_message=f"Section {n} of {len(sections)}:\n\n{section}",
+            )
+            notes.append(f"## Section {n}\n{note.strip()}")
+        text = "\n\n".join(notes)
+    # Notes refused to shrink; fall back to what fits rather than overflow.
+    return text[:SUMMARY_SECTION_CHARS]
 
 
 def generate_flashcards(document_text: str) -> list[dict]:
@@ -249,7 +319,7 @@ RULES:
 - Generate between 10 and 20 flashcards depending on document length
 - Each flashcard must be specific, not generic
 - Prioritize: definitions, formulas, algorithms, key concepts, cause-effect pairs
-- Never create vague cards like "What is important?" 
+- Never create vague cards like "What is important?"
 - For formulas: write them clearly with variable explanations
 
 RESPOND ONLY WITH VALID JSON. No explanation, no markdown, no preamble.
@@ -268,11 +338,10 @@ Difficulty allowed: easy, medium, hard"""
 
     user_message = f"Generate flashcards from this document:\n\n{document_text[:8000]}"
     raw = chat(system_prompt=system_prompt, history=[], user_message=user_message)
-    import json, re
     try:
         clean = re.sub(r"```json|```", "", raw).strip()
         return json.loads(clean)
-    except:
+    except (json.JSONDecodeError, TypeError):
         return []
 
 
@@ -282,7 +351,7 @@ Generate a quiz at difficulty level: {difficulty.upper()}
 
 DIFFICULTY GUIDE:
 - easy: recall facts, simple definitions
-- medium: understanding, application of concepts  
+- medium: understanding, application of concepts
 - exam-level: analysis, multi-step reasoning, edge cases
 
 RULES:
@@ -320,11 +389,10 @@ Format exactly:
 
     user_message = f"Generate a quiz from this document:\n\n{document_text[:8000]}"
     raw = chat(system_prompt=system_prompt, history=[], user_message=user_message)
-    import json, re
     try:
         clean = re.sub(r"```json|```", "", raw).strip()
         return json.loads(clean)
-    except:
+    except (json.JSONDecodeError, TypeError):
         return []
 
 
@@ -385,7 +453,7 @@ Format exactly:
     "name": "Mass-energy equivalence",
     "variables": {
       "E": "Energy in joules",
-      "m": "Mass in kilograms", 
+      "m": "Mass in kilograms",
       "c": "Speed of light (3×10⁸ m/s)"
     },
     "domain": "Physics"
@@ -395,9 +463,8 @@ If no formulas exist, return an empty array: []"""
 
     user_message = f"Extract all formulas from this document:\n\n{document_text[:8000]}"
     raw = chat(system_prompt=system_prompt, history=[], user_message=user_message)
-    import json, re
     try:
         clean = re.sub(r"```json|```", "", raw).strip()
         return json.loads(clean)
-    except:
+    except (json.JSONDecodeError, TypeError):
         return []
