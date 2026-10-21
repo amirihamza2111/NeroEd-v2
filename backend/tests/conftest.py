@@ -1,6 +1,7 @@
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
@@ -19,6 +20,10 @@ def fake_embed(text: str) -> list[float]:
         if "a" <= ch <= "z":
             vec[ord(ch) - ord("a")] += 1.0
     return vec
+
+
+def fake_embed_many(texts: list[str]) -> np.ndarray:
+    return np.asarray([fake_embed(t) for t in texts], dtype=np.float32)
 
 
 class FakeReranker:
@@ -42,6 +47,6 @@ def clean_sessions():
 @pytest.fixture
 def offline_models(monkeypatch):
     """Replace every model call with fast deterministic fakes."""
-    monkeypatch.setattr(main, "embed", fake_embed)
+    monkeypatch.setattr(main, "embed_many", fake_embed_many)
     monkeypatch.setattr(ollama_client, "embed", fake_embed)
     monkeypatch.setattr(ollama_client, "_reranker", FakeReranker())

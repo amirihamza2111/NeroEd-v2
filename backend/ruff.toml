@@ -1,0 +1,12 @@
+line-length = 100
+
+[lint]
+# pycodestyle, pyflakes, bugbear, import sorting
+select = ["E", "F", "W", "B", "I"]
+ignore = [
+    "E501",  # long lines are the LLM prompt strings
+    "B008",  # FastAPI's `File(...)` default is the framework idiom
+]
+
+[lint.isort]
+known-first-party = ["main", "ollama_client", "extractor", "session_manager", "conftest"]

@@ -77,10 +77,10 @@ class TestUpload:
         assert client.get(f"/status/{sid}").json()["status"] == "ready"
 
     def test_embedding_failure_sets_error_status(self, client, monkeypatch):
-        def broken(text):
+        def broken(texts):
             raise RuntimeError("Ollama is not running. Start it with: ollama serve")
 
-        monkeypatch.setattr(main, "embed", broken)
+        monkeypatch.setattr(main, "embed_many", broken)
         sid = upload(client).json()["session_id"]
         status = client.get(f"/status/{sid}").json()
         assert status["status"] == "error"
@@ -109,6 +109,7 @@ class TestChat:
 
         def stream(system_prompt, history, message):
             captured["system"] = system_prompt
+            captured["message"] = message
             yield "The Krebs "
             yield "cycle."
 
@@ -127,8 +128,14 @@ class TestChat:
         assert done["done"] is True
         assert 1 <= len(done["citations"]) <= 5
         assert [c["index"] for c in done["citations"]] == list(range(1, len(done["citations"]) + 1))
-        # Retrieved excerpts are injected into the prompt with matching numbers.
-        assert "[1] " in captured["system"]
+        # The system prompt is fixed; the numbered excerpts and the question
+        # go in the user message, with the excerpt count stated.
+        assert captured["system"] == main.CHAT_SYSTEM_PROMPT
+        n = len(done["citations"])
+        assert f"numbered 1 to {n}" in captured["message"]
+        assert "[1] " in captured["message"] and f"[{n + 1}] " not in captured["message"]
+        assert "Question: Where does the Krebs cycle happen?" in captured["message"]
+        assert done["citations"][0]["chunk"] in captured["message"]
         assert "Krebs" in done["citations"][0]["chunk"]
 
         history = session_manager.get_session(sid)["chat_history"]
@@ -187,7 +194,6 @@ class TestChat:
         ("/summarize", "summarize", {}, "# Summary", "summary"),
         ("/flashcards", "generate_flashcards", {}, [{"id": 1}], "flashcards"),
         ("/quiz", "generate_quiz", {"difficulty": "easy"}, [{"id": 1}, {"id": 2}], "questions"),
-        ("/notes", "generate_notes", {"format": "cornell"}, "notes", "notes"),
         ("/formulas", "extract_formulas", {}, [], "formulas"),
     ],
 )
@@ -208,8 +214,6 @@ class TestStudyTools:
         if "difficulty" in payload:
             assert res.json()["difficulty"] == "easy"
             assert calls[0][1] == "easy"
-        if "format" in payload:
-            assert calls[0][1] == "cornell"
 
     def test_unknown_session(self, client, path, fn_name, payload, result, key):
         assert client.post(path, json={"session_id": "nope", **payload}).status_code == 404
@@ -277,7 +281,6 @@ BLOCKING_ENDPOINTS = [
     "summarize_document",
     "flashcards_endpoint",
     "quiz_endpoint",
-    "notes_endpoint",
     "formulas_endpoint",
     "health",
 ]
@@ -346,3 +349,55 @@ def test_slow_generation_does_not_block_other_requests(offline_models, monkeypat
         http.close()
         server.should_exit = True
         thread.join(timeout=5)
+
+
+# ------------------------------------------------ large documents (speed)
+
+
+def test_indexing_batches_embedding_requests(client, monkeypatch):
+    from conftest import fake_embed_many
+
+    batches = []
+
+    def recording(texts):
+        batches.append(len(texts))
+        return fake_embed_many(texts)
+
+    monkeypatch.setattr(main, "embed_many", recording)
+    big = "word " * 40_000  # ~200k chars -> several hundred chunks
+    sid = upload(client, text=big).json()["session_id"]
+    session = session_manager.get_session(sid)
+    n = len(session["chunks"])
+    assert session["status"] == "ready"
+    assert batches == [main.EMBED_BATCH_SIZE] * (n // main.EMBED_BATCH_SIZE) + (
+        [n % main.EMBED_BATCH_SIZE] if n % main.EMBED_BATCH_SIZE else []
+    )
+    matrix = session["chunk_embeddings"]
+    assert matrix.shape[0] == n
+    assert abs(float((matrix[0] ** 2).sum()) - 1.0) < 1e-4  # rows normalised once
+    assert session["bm25"] is not None
+
+
+def test_upload_size_limit(client, monkeypatch):
+    monkeypatch.setattr(main, "MAX_UPLOAD_MB", 0.001)
+    res = upload(client, text="x" * 5000)
+    assert res.status_code == 413
+
+
+def test_study_tools_sample_whole_large_document(client, monkeypatch):
+    seen = {}
+
+    def capture(text, *rest):
+        seen["text"] = text
+        return []
+
+    monkeypatch.setattr(main, "generate_flashcards", capture)
+    # Ten topics, each with its own vocabulary (so its own embedding cluster),
+    # laid out one after another like chapters.
+    topics = [chr(ord("a") + i) * 6 for i in range(10)]
+    doc = " ".join(f"{word} " * 1000 for word in topics)
+    sid = upload(client, text=doc).json()["session_id"]
+    client.post("/flashcards", json={"session_id": sid})
+    assert len(seen["text"]) <= main.STUDY_TOOL_SOURCE_CHARS
+    # Not just the opening chapters: every chapter contributes passages.
+    assert all(word in seen["text"] for word in topics)

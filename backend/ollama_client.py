@@ -1,4 +1,5 @@
 import json
+import os
 import re
 
 import httpx
@@ -6,24 +7,46 @@ import numpy as np
 from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder
 
-OLLAMA_URL = "http://localhost:11434"
-CHAT_MODEL = "llama3"
-EMBED_MODEL = "nomic-embed-text"
+# 127.0.0.1, not "localhost": on Windows, localhost resolves to IPv6 ::1 first
+# while Ollama listens on IPv4 only, and every request then waits ~2 s for the
+# IPv6 attempt to fail before falling back.
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
+CHAT_MODEL = os.getenv("NEROED_CHAT_MODEL", "llama3")
+EMBED_MODEL = os.getenv("NEROED_EMBED_MODEL", "nomic-embed-text")
 RERANKER_MODEL = "BAAI/bge-reranker-base"
 # The first request after Ollama starts has to load the model into memory,
 # which can take far longer than httpx's 5 second default.
 EMBED_TIMEOUT = httpx.Timeout(120.0, connect=5.0)
+# Chunks per /api/embed request. One request per chunk is dominated by HTTP
+# overhead; batching amortises it and lets the GPU embed chunks together.
+EMBED_BATCH_SIZE = 64
+# Keep models loaded between questions instead of Ollama's 5 minute default,
+# so a pause while studying does not cost a multi-second model reload.
+KEEP_ALIVE = "30m"
 # Ollama defaults to a small context window and silently drops whatever does
-# not fit. llama3 supports 8k tokens, so ask for all of it.
-CHAT_OPTIONS = {"num_ctx": 8192}
+# not fit. llama3 supports 8k tokens, so ask for all of it. num_predict caps
+# a reply at 2,048 tokens (about twice the longest summary), so a model that
+# misses its stop token ends with a cut-off answer instead of a timeout.
+CHAT_OPTIONS = {"num_ctx": 8192, "num_predict": 2048}
 # ~4k tokens per section leaves room for the system prompt and the reply.
 SUMMARY_SECTION_CHARS = 16000
 MAX_CONDENSE_ROUNDS = 3
+JSON_TEMPERATURE = 0.0
 SECTION_NOTES_PROMPT = """You are taking study notes on one section of a longer document.
 Write dense, specific notes covering every concept, definition, formula, date,
 number, and argument in this section. Keep technical terms exactly as written.
 Do not add an introduction or conclusion. Output notes only."""
 _reranker = None
+# One shared client reuses TCP connections; building a new client per request
+# costs ~0.3 s on Windows.
+_client = httpx.Client(base_url=OLLAMA_URL, timeout=httpx.Timeout(300.0, connect=5.0))
+
+_TOKEN_RE = re.compile(r"\w+")
+
+
+def tokenize(text: str) -> list[str]:
+    """Lowercased word tokens for BM25, so "place?" matches "place"."""
+    return _TOKEN_RE.findall(text.lower())
 
 
 def _extract_ollama_error(response: httpx.Response) -> str:
@@ -38,13 +61,14 @@ def _extract_ollama_error(response: httpx.Response) -> str:
     return f"Ollama error: {response.status_code}"
 
 
-def embed(text: str) -> list[float]:
-    """Generate an embedding for the provided text using Ollama."""
-    url = f"{OLLAMA_URL}/api/embeddings"
-    payload = {"model": EMBED_MODEL, "prompt": text}
+def embed_many(texts: list[str]) -> np.ndarray:
+    """Embed a batch of texts in one Ollama request; returns a float32 matrix."""
+    if not texts:
+        return np.zeros((0, 0), dtype=np.float32)
+    payload = {"model": EMBED_MODEL, "input": texts, "keep_alive": KEEP_ALIVE}
 
     try:
-        response = httpx.post(url, json=payload, timeout=EMBED_TIMEOUT)
+        response = _client.post("/api/embed", json=payload, timeout=EMBED_TIMEOUT)
         response.raise_for_status()
     except httpx.TimeoutException as exc:
         raise RuntimeError(
@@ -57,69 +81,86 @@ def embed(text: str) -> list[float]:
     except httpx.HTTPStatusError as exc:
         raise RuntimeError(_extract_ollama_error(exc.response)) from exc
 
-    data = response.json()
-    return data["embedding"]
+    return np.asarray(response.json()["embeddings"], dtype=np.float32)
 
 
-def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    denom = np.linalg.norm(a) * np.linalg.norm(b)
-    if denom == 0:
-        return 0.0
-    return float(np.dot(a, b) / denom)
+def embed(text: str) -> list[float]:
+    """Generate an embedding for a single text."""
+    return embed_many([text])[0].tolist()
+
+
+def normalize_rows(matrix) -> np.ndarray:
+    """L2-normalise each row so a dot product equals cosine similarity."""
+    matrix = np.asarray(matrix, dtype=np.float32)
+    if matrix.ndim == 1:
+        matrix = matrix[None, :]
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return matrix / norms
+
+
+def build_bm25(chunks: list[str]) -> BM25Okapi:
+    return BM25Okapi([tokenize(c) for c in chunks])
+
+
+def _minmax(scores: np.ndarray) -> np.ndarray:
+    mn, mx = float(scores.min()), float(scores.max())
+    if mx - mn < 1e-9:
+        return np.zeros_like(scores, dtype=np.float32)
+    return (scores - mn) / (mx - mn)
 
 
 def retrieve(
     query: str,
     chunks: list[str],
-    chunk_embeddings: list[list[float]],
+    chunk_embeddings,
     top_k: int = 5,
+    bm25: BM25Okapi | None = None,
 ) -> list[dict]:
     """
     Hybrid search: combines BM25 keyword score + cosine similarity score.
     Returns list of dicts: { "chunk": str, "score": float, "index": int }
+
+    `chunk_embeddings` is ideally already row-normalised (normalize_rows) and
+    `bm25` built once per document; both are computed here when missing.
     """
     if not chunks:
         return []
 
-    query_embedding = embed(query)
-    semantic_scores = []
-    for emb in chunk_embeddings:
-        a, b = np.array(query_embedding), np.array(emb)
-        score = _cosine_similarity(a, b)
-        semantic_scores.append(float(score))
+    matrix = normalize_rows(chunk_embeddings)
+    query_vec = normalize_rows(embed(query))[0]
+    semantic = matrix @ query_vec
 
-    tokenized_chunks = [chunk.lower().split() for chunk in chunks]
-    bm25 = BM25Okapi(tokenized_chunks)
-    tokenized_query = query.lower().split()
-    bm25_scores = bm25.get_scores(tokenized_query)
+    if bm25 is None:
+        bm25 = build_bm25(chunks)
+    keyword = np.asarray(bm25.get_scores(tokenize(query)), dtype=np.float32)
 
-    def normalize(scores):
-        arr = np.array(scores)
-        mn, mx = arr.min(), arr.max()
-        if mx - mn < 1e-9:
-            return [0.0] * len(scores)
-        return ((arr - mn) / (mx - mn)).tolist()
-
-    sem_norm = normalize(semantic_scores)
-    bm25_norm = normalize(bm25_scores.tolist())
-
-    combined = [
-        {
-            "chunk": chunks[i],
-            "score": 0.6 * sem_norm[i] + 0.4 * bm25_norm[i],
-            "index": i,
-        }
-        for i in range(len(chunks))
+    combined = 0.6 * _minmax(semantic) + 0.4 * _minmax(keyword)
+    n_candidates = min(len(chunks), max(top_k * 4, 20))
+    top = np.argpartition(-combined, n_candidates - 1)[:n_candidates]
+    top = top[np.argsort(-combined[top])]
+    return [
+        {"chunk": chunks[i], "score": float(combined[i]), "index": int(i)}
+        for i in top
     ]
-    combined.sort(key=lambda x: x["score"], reverse=True)
-    return combined[:max(top_k * 4, 20)]
 
 
 def get_reranker() -> CrossEncoder:
     """Lazy-load the reranker model on first use."""
     global _reranker
     if _reranker is None:
-        _reranker = CrossEncoder(RERANKER_MODEL)
+        import torch
+
+        if torch.cuda.is_available():
+            # fp16 on the GPU: ~35 ms per question instead of ~1.1 s on the
+            # CPU, in ~0.5 GB of VRAM next to the Ollama models.
+            _reranker = CrossEncoder(
+                RERANKER_MODEL,
+                device="cuda",
+                model_kwargs={"torch_dtype": torch.float16},
+            )
+        else:
+            _reranker = CrossEncoder(RERANKER_MODEL)
     return _reranker
 
 
@@ -159,14 +200,15 @@ def chat_stream(system_prompt: str, history: list[dict], user_message: str):
         {"role": "user", "content": user_message},
     ]
     try:
-        with httpx.stream(
+        with _client.stream(
             "POST",
-            f"{OLLAMA_URL}/api/chat",
+            "/api/chat",
             json={
                 "model": CHAT_MODEL,
                 "messages": messages,
                 "stream": True,
                 "options": CHAT_OPTIONS,
+                "keep_alive": KEEP_ALIVE,
             },
             timeout=120,
         ) as response:
@@ -189,10 +231,13 @@ def chat_stream(system_prompt: str, history: list[dict], user_message: str):
         ) from exc
 
 
-def chat(system_prompt: str, history: list[dict], user_message: str) -> str:
+def chat(
+    system_prompt: str,
+    history: list[dict],
+    user_message: str,
+    temperature: float | None = None,
+) -> str:
     """Send a chat request to Ollama and return the response content."""
-    # Used internally by summarize()
-    url = f"{OLLAMA_URL}/api/chat"
     messages = [
         {"role": "system", "content": system_prompt},
         *history,
@@ -202,11 +247,14 @@ def chat(system_prompt: str, history: list[dict], user_message: str) -> str:
         "model": CHAT_MODEL,
         "messages": messages,
         "stream": False,
-        "options": CHAT_OPTIONS,
+        "keep_alive": KEEP_ALIVE,
+        "options": CHAT_OPTIONS
+        if temperature is None
+        else {**CHAT_OPTIONS, "temperature": temperature},
     }
 
     try:
-        response = httpx.post(url, json=payload,timeout=300.0)
+        response = _client.post("/api/chat", json=payload, timeout=300.0)
         response.raise_for_status()
     except httpx.RequestError as exc:
         raise RuntimeError(
@@ -337,7 +385,13 @@ Types allowed: definition, formula, concept, process, fact
 Difficulty allowed: easy, medium, hard"""
 
     user_message = f"Generate flashcards from this document:\n\n{document_text[:8000]}"
-    raw = chat(system_prompt=system_prompt, history=[], user_message=user_message)
+    # Structured extraction should copy from the document, not improvise.
+    raw = chat(
+        system_prompt=system_prompt,
+        history=[],
+        user_message=user_message,
+        temperature=JSON_TEMPERATURE,
+    )
     try:
         clean = re.sub(r"```json|```", "", raw).strip()
         return json.loads(clean)
@@ -388,55 +442,18 @@ Format exactly:
 ]"""
 
     user_message = f"Generate a quiz from this document:\n\n{document_text[:8000]}"
-    raw = chat(system_prompt=system_prompt, history=[], user_message=user_message)
+    # Structured extraction should copy from the document, not improvise.
+    raw = chat(
+        system_prompt=system_prompt,
+        history=[],
+        user_message=user_message,
+        temperature=JSON_TEMPERATURE,
+    )
     try:
         clean = re.sub(r"```json|```", "", raw).strip()
         return json.loads(clean)
     except (json.JSONDecodeError, TypeError):
         return []
-
-
-def generate_notes(document_text: str, format: str = "bullet") -> str:
-    formats = {
-        "bullet": """Generate clean bullet-point study notes.
-Structure:
-## 📚 Topic
-- Key point
-  - Sub-point if needed
-Group by theme. Cover everything important.""",
-
-        "cheatsheet": """Generate a compact cheat sheet.
-Use this structure:
-## ⚡ [CONCEPT] | definition in one line
-Include: formulas, key terms, rules, exceptions.
-Ultra-dense. Every line must be valuable.""",
-
-        "cornell": """Generate Cornell-style notes.
-Format exactly:
-### CUE | NOTE
-[keyword or question] | [detailed explanation]
-At the bottom add:
-## SUMMARY
-3-5 sentence summary of the entire document.""",
-
-        "timeline": """Generate a chronological timeline if dates/sequences exist.
-Format:
-## ⏱️ [Date/Stage] — [Event/Step]
-Description in 1-2 lines.
-If no dates exist, create a logical sequence of concepts instead."""
-    }
-
-    system_prompt = f"""You are an elite academic note-taker used by top university students.
-{formats.get(format, formats['bullet'])}
-
-RULES:
-- Be specific, never generic
-- Preserve all technical terms
-- Include formulas and definitions exactly
-- Organize logically"""
-
-    user_message = f"Generate {format} notes from this document:\n\n{document_text[:8000]}"
-    return chat(system_prompt=system_prompt, history=[], user_message=user_message)
 
 
 def extract_formulas(document_text: str) -> list[dict]:
@@ -462,7 +479,13 @@ Format exactly:
 If no formulas exist, return an empty array: []"""
 
     user_message = f"Extract all formulas from this document:\n\n{document_text[:8000]}"
-    raw = chat(system_prompt=system_prompt, history=[], user_message=user_message)
+    # Structured extraction should copy from the document, not improvise.
+    raw = chat(
+        system_prompt=system_prompt,
+        history=[],
+        user_message=user_message,
+        temperature=JSON_TEMPERATURE,
+    )
     try:
         clean = re.sub(r"```json|```", "", raw).strip()
         return json.loads(clean)

@@ -1,7 +1,7 @@
 from io import BytesIO
 
-import fitz
 import docx
+import fitz
 
 
 def extract_text(file_bytes: bytes, filename: str) -> str:
@@ -36,9 +36,10 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> list[str]
     start = 0
 
     while start < len(text):
-        chunk = text[start : start + chunk_size]
-        if chunk:
-            chunks.append(chunk)
+        chunks.append(text[start : start + chunk_size])
+        if start + chunk_size >= len(text):
+            # This chunk reached the end; another would only repeat its tail.
+            break
         start += step
 
     return chunks

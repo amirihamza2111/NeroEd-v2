@@ -139,11 +139,6 @@ def test_quiz(client, sid):
     assert all("question" in q and "type" in q for q in data["questions"])
 
 
-def test_notes(client, sid):
-    data = client.post("/notes", json={"session_id": sid, "format": "cheatsheet"}).json()
-    assert len(data["notes"]) > 100
-
-
 def test_formulas(client, sid):
     data = client.post("/formulas", json={"session_id": sid}).json()
     print(f"\nformulas: {[f.get('formula') for f in data['formulas']]}")

@@ -73,6 +73,14 @@ class TestChunkText:
         rebuilt = chunks[0] + "".join(c[10:] for c in chunks[1:])
         assert rebuilt == text
 
+    def test_no_redundant_tail_chunk(self):
+        # 1000 chars with step 450: the chunk at 450 already reaches the end,
+        # so a third chunk would only repeat text from its overlap.
+        chunks = chunk_text("y" * 1000, chunk_size=500, overlap=50)
+        assert [len(c) for c in chunks] == [500, 500, 100]
+        chunks = chunk_text("y" * 950, chunk_size=500, overlap=50)
+        assert [len(c) for c in chunks] == [500, 500]
+
     @pytest.mark.parametrize(
         "size,overlap", [(0, 0), (-5, 0), (10, -1), (10, 10), (10, 20)]
     )

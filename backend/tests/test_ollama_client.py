@@ -36,10 +36,12 @@ def chat_reply(text: str):
 
 class TestEmbed:
     def test_returns_embedding_and_sets_long_timeout(self, monkeypatch):
-        post = PostRecorder(lambda url, kw: response(200, {"embedding": [0.1, 0.2]}))
-        monkeypatch.setattr(httpx, "post", post)
+        post = PostRecorder(lambda url, kw: response(200, {"embeddings": [[0.1, 0.2]]}))
+        monkeypatch.setattr(ollama_client._client, "post", post)
 
-        assert ollama_client.embed("hello") == [0.1, 0.2]
+        assert ollama_client.embed("hello") == pytest.approx([0.1, 0.2])
+        assert post.calls[0]["url"] == "/api/embed"
+        assert post.calls[0]["json"]["input"] == ["hello"]
 
         timeout = post.calls[0]["timeout"]
         assert isinstance(timeout, httpx.Timeout)
@@ -50,7 +52,7 @@ class TestEmbed:
         def boom(url, kw):
             raise httpx.ReadTimeout("slow")
 
-        monkeypatch.setattr(httpx, "post", PostRecorder(boom))
+        monkeypatch.setattr(ollama_client._client, "post", PostRecorder(boom))
         with pytest.raises(RuntimeError, match="timed out"):
             ollama_client.embed("hello")
 
@@ -58,13 +60,13 @@ class TestEmbed:
         def boom(url, kw):
             raise httpx.ConnectError("refused")
 
-        monkeypatch.setattr(httpx, "post", PostRecorder(boom))
+        monkeypatch.setattr(ollama_client._client, "post", PostRecorder(boom))
         with pytest.raises(RuntimeError, match="not running"):
             ollama_client.embed("hello")
 
     def test_http_error_surfaces_ollama_message(self, monkeypatch):
         monkeypatch.setattr(
-            httpx,
+            ollama_client._client,
             "post",
             PostRecorder(lambda url, kw: response(404, {"error": "model not found"})),
         )
@@ -127,13 +129,13 @@ class TestRerank:
 class TestChat:
     def test_requests_full_context_window(self, monkeypatch):
         post = PostRecorder(chat_reply("hi"))
-        monkeypatch.setattr(httpx, "post", post)
+        monkeypatch.setattr(ollama_client._client, "post", post)
         assert ollama_client.chat("sys", [], "user") == "hi"
         assert post.calls[0]["json"]["options"]["num_ctx"] == 8192
 
     def test_history_is_forwarded_in_order(self, monkeypatch):
         post = PostRecorder(chat_reply("ok"))
-        monkeypatch.setattr(httpx, "post", post)
+        monkeypatch.setattr(ollama_client._client, "post", post)
         history = [
             {"role": "user", "content": "a"},
             {"role": "assistant", "content": "b"},
@@ -165,19 +167,19 @@ class TestChatStream:
             {"message": {"content": "IGNORED"}},
         )
         calls: list = []
-        monkeypatch.setattr(httpx, "stream", fake_stream(response(200, body), calls))
+        monkeypatch.setattr(ollama_client._client, "stream", fake_stream(response(200, body), calls))
         assert list(ollama_client.chat_stream("s", [], "u")) == ["Hel", "lo"]
         assert calls[0]["json"]["options"]["num_ctx"] == 8192
 
     def test_http_error_raises(self, monkeypatch):
         resp = response(404, {"error": "model 'llama3' not found"})
-        monkeypatch.setattr(httpx, "stream", fake_stream(resp))
+        monkeypatch.setattr(ollama_client._client, "stream", fake_stream(resp))
         with pytest.raises(RuntimeError, match="not found"):
             list(ollama_client.chat_stream("s", [], "u"))
 
     def test_error_line_mid_stream_raises(self, monkeypatch):
         body = ndjson({"message": {"content": "partial"}}, {"error": "out of memory"})
-        monkeypatch.setattr(httpx, "stream", fake_stream(response(200, body)))
+        monkeypatch.setattr(ollama_client._client, "stream", fake_stream(response(200, body)))
         gen = ollama_client.chat_stream("s", [], "u")
         assert next(gen) == "partial"
         with pytest.raises(RuntimeError, match="out of memory"):
@@ -187,7 +189,7 @@ class TestChatStream:
         def boom(*a, **kw):
             raise httpx.ConnectError("refused")
 
-        monkeypatch.setattr(httpx, "stream", boom)
+        monkeypatch.setattr(ollama_client._client, "stream", boom)
         with pytest.raises(RuntimeError, match="not running"):
             list(ollama_client.chat_stream("s", [], "u"))
 
@@ -198,7 +200,7 @@ class TestChatStream:
 class TestSummarize:
     def test_short_document_is_sent_whole_in_one_call(self, monkeypatch):
         post = PostRecorder(chat_reply("SUMMARY"))
-        monkeypatch.setattr(httpx, "post", post)
+        monkeypatch.setattr(ollama_client._client, "post", post)
         doc = "Short document about cells. " * 10
         assert ollama_client.summarize(doc) == "SUMMARY"
         assert len(post.calls) == 1
@@ -206,7 +208,7 @@ class TestSummarize:
 
     def test_long_document_is_map_reduced(self, monkeypatch):
         post = PostRecorder(chat_reply("dense notes for this section"))
-        monkeypatch.setattr(httpx, "post", post)
+        monkeypatch.setattr(ollama_client._client, "post", post)
         size = ollama_client.SUMMARY_SECTION_CHARS
         # Mark the very end so we can prove it is not silently dropped.
         doc = "a" * (size * 2) + "b" * 100 + "THE_END_MARKER"
@@ -225,7 +227,7 @@ class TestSummarize:
         size = ollama_client.SUMMARY_SECTION_CHARS
         # Pathological model that answers every section with a huge reply.
         post = PostRecorder(chat_reply("n" * size))
-        monkeypatch.setattr(httpx, "post", post)
+        monkeypatch.setattr(ollama_client._client, "post", post)
         ollama_client.summarize("x" * (size * 3))
         final_prompt = post.calls[-1]["json"]["messages"][-1]["content"]
         assert len(final_prompt) < size + 1000
@@ -240,29 +242,104 @@ class TestSummarize:
 class TestJsonGenerators:
     def test_parses_fenced_json(self, monkeypatch, fn):
         payload = '```json\n[{"id": 1, "question": "q", "answer": "a"}]\n```'
-        monkeypatch.setattr(httpx, "post", PostRecorder(chat_reply(payload)))
+        monkeypatch.setattr(ollama_client._client, "post", PostRecorder(chat_reply(payload)))
         assert fn("doc") == [{"id": 1, "question": "q", "answer": "a"}]
 
     def test_invalid_json_returns_empty(self, monkeypatch, fn):
-        monkeypatch.setattr(httpx, "post", PostRecorder(chat_reply("not json")))
+        monkeypatch.setattr(ollama_client._client, "post", PostRecorder(chat_reply("not json")))
         assert fn("doc") == []
+
+    def test_uses_zero_temperature(self, monkeypatch, fn):
+        post = PostRecorder(chat_reply("[]"))
+        monkeypatch.setattr(ollama_client._client, "post", post)
+        fn("doc")
+        options = post.calls[0]["json"]["options"]
+        assert options["temperature"] == 0.0
+        assert options["num_ctx"] == 8192
 
     def test_input_is_truncated(self, monkeypatch, fn):
         post = PostRecorder(chat_reply("[]"))
-        monkeypatch.setattr(httpx, "post", post)
+        monkeypatch.setattr(ollama_client._client, "post", post)
         fn("z" * 50_000)
         assert post.calls[0]["json"]["messages"][-1]["content"].count("z") == 8000
 
 
 def test_quiz_difficulty_in_prompt(monkeypatch):
     post = PostRecorder(chat_reply("[]"))
-    monkeypatch.setattr(httpx, "post", post)
+    monkeypatch.setattr(ollama_client._client, "post", post)
     assert ollama_client.generate_quiz("doc", "hard") == []
     assert "HARD" in post.calls[0]["json"]["messages"][0]["content"]
+    assert post.calls[0]["json"]["options"]["temperature"] == 0.0
 
 
-@pytest.mark.parametrize("fmt", ["bullet", "cheatsheet", "cornell", "timeline", "bogus"])
-def test_notes_formats(monkeypatch, fmt):
-    post = PostRecorder(chat_reply("# notes"))
-    monkeypatch.setattr(httpx, "post", post)
-    assert ollama_client.generate_notes("doc", fmt) == "# notes"
+def test_free_text_keeps_default_temperature(monkeypatch):
+    post = PostRecorder(chat_reply("text"))
+    monkeypatch.setattr(ollama_client._client, "post", post)
+    ollama_client.summarize("short doc")
+    for call in post.calls:
+        assert "temperature" not in call["json"]["options"]
+
+
+# ------------------------------------------------- transport + speed settings
+
+
+def test_default_url_avoids_localhost_ipv6_delay():
+    # "localhost" resolves to ::1 first on Windows while Ollama listens on IPv4,
+    # which added ~2 s to every request.
+    assert "127.0.0.1" in ollama_client.OLLAMA_URL
+
+
+def test_embed_many_sends_one_request_per_batch(monkeypatch):
+    post = PostRecorder(
+        lambda url, kw: response(200, {"embeddings": [[1.0, 0.0]] * len(kw["json"]["input"])})
+    )
+    monkeypatch.setattr(ollama_client._client, "post", post)
+    matrix = ollama_client.embed_many(["a", "b", "c"])
+    assert matrix.shape == (3, 2)
+    assert len(post.calls) == 1
+    assert post.calls[0]["json"]["input"] == ["a", "b", "c"]
+    assert post.calls[0]["json"]["keep_alive"] == ollama_client.KEEP_ALIVE
+
+
+def test_chat_keeps_model_loaded(monkeypatch):
+    post = PostRecorder(chat_reply("hi"))
+    monkeypatch.setattr(ollama_client._client, "post", post)
+    ollama_client.chat("s", [], "u")
+    assert post.calls[0]["json"]["keep_alive"] == ollama_client.KEEP_ALIVE
+
+
+def test_tokenize_ignores_punctuation():
+    assert ollama_client.tokenize("Where does it take place?") == [
+        "where", "does", "it", "take", "place",
+    ]
+
+
+def test_bm25_matches_question_words_with_punctuation(monkeypatch):
+    monkeypatch.setattr(ollama_client, "embed", fake_embed)
+    chunks = ["the krebs cycle takes place in the mitochondria", "zzz qqq", "yyy www"]
+    embs = [fake_embed("aaaa")] * 3  # identical, so only BM25 can separate them
+    result = ollama_client.retrieve("Where does it take place?", chunks, embs)
+    assert result[0]["index"] == 0
+
+
+def test_retrieve_uses_prebuilt_bm25(monkeypatch):
+    monkeypatch.setattr(ollama_client, "embed", fake_embed)
+    chunks = ["alpha beta", "gamma delta", "epsilon zeta"]
+    bm25 = ollama_client.build_bm25(chunks)
+    calls = []
+    real = bm25.get_scores
+    bm25.get_scores = lambda q: calls.append(q) or real(q)
+    monkeypatch.setattr(ollama_client, "build_bm25", lambda c: pytest.fail("rebuilt BM25"))
+    ollama_client.retrieve("gamma", chunks, [fake_embed(c) for c in chunks], bm25=bm25)
+    assert calls == [["gamma"]]
+
+
+def test_replies_are_length_capped(monkeypatch):
+    # A model that misses its stop token must not generate until the request
+    # times out; every chat call carries a hard output limit.
+    post = PostRecorder(chat_reply("hi"))
+    monkeypatch.setattr(ollama_client._client, "post", post)
+    ollama_client.chat("s", [], "u")
+    ollama_client.chat("s", [], "u", temperature=0.0)
+    for call in post.calls:
+        assert call["json"]["options"]["num_predict"] == 2048

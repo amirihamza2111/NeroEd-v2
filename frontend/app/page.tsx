@@ -22,6 +22,36 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 type Citation = { index: number; chunk: string; score: number };
 
+type Tab = "chat" | "flashcards" | "quiz" | "formulas";
+
+// Shapes match the JSON the backend prompts ask the model to return.
+type Flashcard = {
+  id: number;
+  question: string;
+  answer: string;
+  type?: string;
+  difficulty?: string;
+};
+
+type QuizQuestion = {
+  id: number;
+  type: "mcq" | "truefalse" | "shortanswer";
+  question: string;
+  options?: string[];
+  correct?: string | boolean;
+  model_answer?: string;
+  explanation?: string;
+};
+
+type Formula = {
+  id: number;
+  formula: string;
+  latex: string;
+  name: string;
+  variables?: Record<string, string>;
+  domain?: string;
+};
+
 type Message = {
   role: "user" | "assistant";
   content: string;
@@ -41,17 +71,15 @@ export default function Page() {
     "connected" | "offline" | "checking"
   >("checking");
 
-  const [activeTab, setActiveTab] = useState<"chat" | "flashcards" | "quiz" | "notes" | "formulas">("chat");
-  const [flashcards, setFlashcards] = useState<any[]>([]);
+  const [activeTab, setActiveTab] = useState<Tab>("chat");
+  const [flashcards, setFlashcards] = useState<Flashcard[]>([]);
   const [currentCard, setCurrentCard] = useState(0);
   const [cardFlipped, setCardFlipped] = useState(false);
-  const [quiz, setQuiz] = useState<any[]>([]);
+  const [quiz, setQuiz] = useState<QuizQuestion[]>([]);
   const [quizAnswers, setQuizAnswers] = useState<Record<number, string>>({});
   const [quizSubmitted, setQuizSubmitted] = useState(false);
   const [quizDifficulty, setQuizDifficulty] = useState("medium");
-  const [notes, setNotes] = useState("");
-  const [notesFormat, setNotesFormat] = useState("bullet");
-  const [formulas, setFormulas] = useState<any[]>([]);
+  const [formulas, setFormulas] = useState<Formula[]>([]);
   const [featureLoading, setFeatureLoading] = useState(false);
 
   const [sessionStatus, setSessionStatus] = useState<"idle" | "embedding" | "ready" | "error">("idle");
@@ -70,7 +98,7 @@ export default function Page() {
         const response = await fetch(`${API_URL}/health`);
         const data = await response.json();
         setOllamaStatus(data.ollama === "connected" ? "connected" : "offline");
-      } catch (error) {
+      } catch {
         setOllamaStatus("offline");
       }
     };
@@ -90,7 +118,7 @@ export default function Page() {
       if (data && typeof data.error === "string") {
         return data.error;
       }
-    } catch (error) {
+    } catch {
       return fallback;
     }
 
@@ -330,25 +358,6 @@ export default function Page() {
     setFeatureLoading(false);
   };
 
-  const generateNotes = async (format: string) => {
-    if (!sessionId) return;
-    setFeatureLoading(true);
-    setNotesFormat(format);
-    try {
-      const res = await fetch(`${API_URL}/notes`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: sessionId, format }),
-      });
-      if (!res.ok) throw new Error(await parseError(res, "Notes generation failed"));
-      const data = await res.json();
-      setNotes(data.notes || "");
-    } catch (error) {
-      alert(error instanceof Error ? error.message : "Notes generation failed");
-    }
-    setFeatureLoading(false);
-  };
-
   const generateFormulas = async () => {
     if (!sessionId) return;
     setFeatureLoading(true);
@@ -384,18 +393,6 @@ export default function Page() {
     a.download = "flashcards.csv";
     a.click();
     URL.revokeObjectURL(url);
-  };
-
-  const downloadNotesTxt = () => {
-    if (!notes) return;
-    const blob = new Blob([notes], { type: 'text/plain;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.setAttribute("href", url);
-    link.setAttribute("download", "notes.txt");
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
   };
 
   const handleKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
@@ -552,7 +549,6 @@ export default function Page() {
                 { key: "chat", label: "💬 Chat" },
                 { key: "flashcards", label: "🃏 Flashcards" },
                 { key: "quiz", label: "📝 Quiz" },
-                { key: "notes", label: "📋 Notes" },
                 { key: "formulas", label: "🔢 Formulas" }
               ].map(tab => {
                 const isReady = sessionStatus === "ready";
@@ -560,7 +556,7 @@ export default function Page() {
                 <button
                   key={tab.key}
                   disabled={!isReady}
-                  onClick={() => setActiveTab(tab.key as any)}
+                  onClick={() => setActiveTab(tab.key as Tab)}
                   className={`px-4 py-2 text-sm font-medium whitespace-nowrap border-b-2 transition-colors
                     ${activeTab === tab.key 
                       ? "border-indigo-500 text-indigo-600" 
@@ -598,7 +594,7 @@ export default function Page() {
                           {message.content}
                         </div>
                       </div>
-                    ) : (
+                    ) : message.isStreaming && !message.content ? null : (
                       <div key={index} className="flex items-start gap-3">
                         <div className="flex h-8 w-8 items-center justify-center rounded-full bg-indigo-100 text-indigo-600">
                           <svg
@@ -621,12 +617,12 @@ export default function Page() {
                           <div className="rounded-2xl rounded-tl-sm border border-slate-200 bg-white px-4 py-3 text-sm text-slate-800 shadow-sm prose prose-sm max-w-none">
                             <ReactMarkdown
                               components={{
-                                strong: ({node, ...props}) => <strong className="font-bold text-gray-900" {...props} />,
-                                ul: ({node, ...props}) => <ul className="list-disc ml-4 space-y-1" {...props} />,
-                                ol: ({node, ...props}) => <ol className="list-decimal ml-4 space-y-1" {...props} />,
-                                h3: ({node, ...props}) => <h3 className="font-bold text-base mt-3 mb-1" {...props} />,
-                                p: ({node, ...props}) => <p className="mb-2" {...props} />,
-                                hr: ({node, ...props}) => <hr className="my-3 border-gray-200" {...props} />,
+                                strong: ({ node, ...props }) => <strong className="font-bold text-gray-900" {...props} />,
+                                ul: ({ node, ...props }) => <ul className="list-disc ml-4 space-y-1" {...props} />,
+                                ol: ({ node, ...props }) => <ol className="list-decimal ml-4 space-y-1" {...props} />,
+                                h3: ({ node, ...props }) => <h3 className="font-bold text-base mt-3 mb-1" {...props} />,
+                                p: ({ node, ...props }) => <p className="mb-2" {...props} />,
+                                hr: ({ node, ...props }) => <hr className="my-3 border-gray-200" {...props} />,
                               }}
                             >
                               {message.content}
@@ -659,7 +655,7 @@ export default function Page() {
                     )
                   )}
 
-                  {chatLoading && (
+                  {chatLoading && !messages[messages.length - 1]?.content && (
                     <div className="flex items-start gap-3">
                       <div className="flex h-8 w-8 items-center justify-center rounded-full bg-indigo-100 text-indigo-600">
                         <svg
@@ -932,55 +928,6 @@ export default function Page() {
                           </button>
                         </div>
                       )}
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {activeTab === "notes" && (
-                <div className="flex flex-col gap-6 max-w-4xl mx-auto w-full">
-                  <div className="flex items-center gap-2 bg-white p-2 rounded-2xl border border-slate-200 shadow-sm overflow-x-auto">
-                    {[
-                      { key: "bullet", label: "Bullet Notes" },
-                      { key: "cheatsheet", label: "Cheat Sheet" },
-                      { key: "cornell", label: "Cornell Notes" },
-                      { key: "timeline", label: "Timeline" }
-                    ].map(f => (
-                      <button
-                        key={f.key}
-                        onClick={() => generateNotes(f.key)}
-                        disabled={!sessionId || featureLoading}
-                        className={`px-4 py-2 text-sm rounded-xl font-medium whitespace-nowrap transition-colors ${notesFormat === f.key && notes ? "bg-indigo-100 text-indigo-700" : "hover:bg-slate-50 text-slate-600"}`}
-                      >
-                        {f.label}
-                      </button>
-                    ))}
-                  </div>
-
-                  {featureLoading && <div className="text-center py-10 text-slate-500">Generating notes...</div>}
-
-                  {!featureLoading && notes && (
-                    <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-                      <div className="flex items-center justify-between border-b border-slate-100 bg-slate-50 px-4 py-3">
-                        <span className="text-sm font-semibold capitalize text-slate-600">{notesFormat} Notes</span>
-                        <div className="flex gap-2">
-                          <button
-                            onClick={() => navigator.clipboard.writeText(notes)}
-                            className="text-xs font-medium px-3 py-1.5 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 text-slate-600"
-                          >
-                            Copy
-                          </button>
-                          <button
-                            onClick={downloadNotesTxt}
-                            className="text-xs font-medium px-3 py-1.5 bg-indigo-500 border border-indigo-500 rounded-lg hover:bg-indigo-400 text-white"
-                          >
-                            Download .txt
-                          </button>
-                        </div>
-                      </div>
-                      <div className="p-6 prose prose-slate max-w-none prose-h2:text-indigo-600 prose-h3:text-slate-700">
-                        <ReactMarkdown>{notes}</ReactMarkdown>
-                      </div>
                     </div>
                   )}
                 </div>
